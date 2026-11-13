@@ -24,12 +24,12 @@ urlpatterns = [
         name="threshold-detail",
     ),
     path(
-        "bulk-upload/preview/",
+        "reports/bulk-upload/preview/",
         BulkUploadPreviewView.as_view(),
         name="bulk-upload-preview",
     ),
     path(
-        "bulk-upload/confirm/",
+        "reports/bulk-upload/confirm/",
         BulkUploadConfirmView.as_view(),
         name="bulk-upload-confirm",
     ),
