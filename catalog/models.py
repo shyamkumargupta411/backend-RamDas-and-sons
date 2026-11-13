@@ -244,12 +244,13 @@ class ProductVariant(models.Model):
     def save(self, *args, **kwargs):
         from .services import make_spec_key
 
-        self.spec_key = make_spec_key(
-            thickness=self.thickness,
-            width=self.width,
-            length=self.length,
-            diameter=self.diameter,
-            weight=self.weight,
-            unit_code=self.unit.code if self.unit_id else "",
-        )
+        if not self.spec_key:
+            self.spec_key = make_spec_key(
+                thickness=self.thickness,
+                width=self.width,
+                length=self.length,
+                diameter=self.diameter,
+                weight=self.weight,
+                unit_code=self.unit.code if self.unit_id else "",
+            )
         super().save(*args, **kwargs)

@@ -1009,6 +1009,16 @@ class BulkUploadConfirmView(APIView):
                     if not pname or not vspec:
                         raise ValueError("product_name and variant_spec required")
 
+                    # Skip zero or negative quantity rows
+                    if qty <= 0:
+                        errors.append(
+                            {
+                                "raw_name": entry.get("raw_name", ""),
+                                "error": "Quantity must be greater than zero.",
+                            }
+                        )
+                        continue
+
                     # Shop for this row (override default)
                     row_shop = shop
                     if shop_pk:
