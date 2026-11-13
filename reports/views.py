@@ -7,7 +7,7 @@ from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.db.models import Q, Sum
 from django.http import HttpResponse
-from openpyxl import load_workbook
+from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Font, Alignment, PatternFill
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
@@ -908,7 +908,7 @@ class BulkUploadPreviewView(APIView):
             return Response({"error": "No file provided."}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            wb = openpyxl.load_workbook(io.BytesIO(file.read()), data_only=True)
+            wb = load_workbook(io.BytesIO(file.read()), data_only=True)
         except Exception as exc:
             return Response({"error": f"Invalid Excel file: {exc}"}, status=status.HTTP_400_BAD_REQUEST)
 
