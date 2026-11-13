@@ -1,7 +1,10 @@
 import io
+import re
 from datetime import date, timedelta
+from decimal import Decimal
 
 from django.core.exceptions import ValidationError
+from django.db import transaction
 from django.db.models import Q, Sum
 from django.http import HttpResponse
 from openpyxl import Workbook
@@ -13,12 +16,16 @@ from rest_framework.views import APIView
 
 from accounts.models import Shop, User
 from accounts.permissions import IsOwnerOrManager
-from catalog.models import ProductVariant
+from catalog.models import ProductCategory, Product, ProductVariant, Unit
 from inventory.models import (
     ProductReturn,
     StockAdjustment,
     StockLevel,
     StockMovement,
+    StockReceipt,
+    StockReceiptLine,
+    StockTransfer,
+    StockTransferItem,
 )
 from sales.models import Sale, SaleItem
 
@@ -762,3 +769,302 @@ class LowStockThresholdViewSet(APIView):
         th.updated_by = request.user
         th.save()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ---------------------------------------------------------------------------
+# Bulk material upload (Excel)
+# ---------------------------------------------------------------------------
+
+import re  # noqa: E402
+
+
+def _parse_material_name(raw_name, default_unit="KG"):
+    """
+    Parse a raw material string like:
+      'GI SATTER PATTI (HAVY) 14 FUT'
+      '3/4"GRIL PATTI(LIGHT)'
+      '40*10 PATIYA'
+      '1" ANGLE (LIGHT)'
+      'HR SHEET 50KG (BOKARO)'
+    Returns (product_name, variant_spec, unit_code).
+    Best-effort; frontend lets user edit before confirm.
+    """
+    if not raw_name:
+        raise ValueError("Empty material name")
+    s = str(raw_name).strip()
+    if not s:
+        raise ValueError("Empty material name")
+
+    unit_code = default_unit
+    measurement = ""
+
+    # Try trailing measurement: number + unit word at end
+    # Examples: 14 FUT, 2.5 KG, 3/4", 40*10, 20MM, 5.6KG
+    trail = re.search(
+        r"(.+?)\s+([\d./" + r"\"”’" + r"]+(?:\s*[\d./" + r"\"”’" + r"]+)*\s*"
+        r"(?:FUT|FEET|FT|INCH|INCHES|KG|KGS|MM|CM|MTR|METER|METERS|GOL|PILA|HARA|NILA|SQ|SFT))\s*$",
+        s,
+        re.IGNORECASE,
+    )
+    if trail:
+        s = trail.group(1).strip()
+        measurement = trail.group(2).strip()
+        ml = measurement.lower()
+        if "kg" in ml:
+            unit_code = "KG"
+        elif any(u in ml for u in ("fut", "feet", "ft")):
+            unit_code = "FEET"
+        elif "inch" in ml:
+            unit_code = "INCH"
+        elif "mm" in ml:
+            unit_code = "MM"
+        elif "cm" in ml:
+            unit_code = "CM"
+        elif any(u in ml for u in ("mtr", "meter", "meters")):
+            unit_code = "FEET"
+
+    # Extract parenthetical content
+    paren = ""
+    pm = re.search(r"\(([^)]+)\)", s)
+    if pm:
+        paren = pm.group(1).strip()
+        s = s.replace(pm.group(0), "").strip()
+
+    product_name = s.strip()
+
+    # Build variant spec from parenthetical + measurement
+    variant_parts = [p for p in [paren, measurement] if p]
+    variant_spec = " ".join(variant_parts) if variant_parts else product_name
+
+    return product_name, variant_spec, unit_code
+
+
+def _get_or_create_unit(code, name=None, unit_type="COUNT"):
+    code = (code or "KG").strip().upper()
+    name = name or code
+    unit_type = unit_type or "COUNT"
+    unit, _ = Unit.objects.get_or_create(
+        code=code,
+        defaults={"name": name, "unit_type": unit_type, "is_active": True},
+    )
+    return unit
+
+
+def _get_or_create_product(name, material, user):
+    name = name.strip()
+    category, _ = ProductCategory.objects.get_or_create(
+        code="other-metal",
+        defaults={
+            "name": "Other Metal",
+            "form_factor": ProductCategory.FormFactor.OTHER,
+            "is_active": True,
+        },
+    )
+    product, _ = Product.objects.get_or_create(
+        code=name.upper().replace(" ", "-")[:20],
+        defaults={
+            "name": name,
+            "category": category,
+            "material": material or "MS",
+            "grade": "",
+            "status": Product.Status.ACTIVE,
+            "created_by": user,
+        },
+    )
+    return product
+
+
+def _get_or_create_variant(product, spec_key, unit, user):
+    variant, _ = ProductVariant.objects.get_or_create(
+        product=product,
+        spec_key=spec_key,
+        defaults={
+            "unit": unit,
+            "thickness": None,
+            "width": None,
+            "length": None,
+            "diameter": None,
+            "weight": None,
+            "weight_per_piece": None,
+            "length_per_piece": None,
+            "is_active": True,
+            "created_by": user,
+        },
+    )
+    return variant
+
+
+class BulkUploadPreviewView(APIView):
+    """POST Excel file -> return parsed rows with suggested product/variant/unit.
+    Frontend can edit before confirming.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        file = request.FILES.get("file")
+        if not file:
+            return Response({"error": "No file provided."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            wb = openpyxl.load_workbook(io.BytesIO(file.read()), data_only=True)
+        except Exception as exc:
+            return Response({"error": f"Invalid Excel file: {exc}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        ws = wb.active
+        rows = []
+        for idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+            if not any(v is not None and str(v).strip() != "" for v in row):
+                continue
+            raw_name = str(row[0]).strip() if row[0] is not None else ""
+            if not raw_name:
+                continue
+            qty = row[1] if len(row) > 1 and row[1] is not None else 0
+            try:
+                qty = float(qty)
+            except (TypeError, ValueError):
+                qty = 0.0
+            unit_code = str(row[2]).strip().upper() if len(row) > 2 and row[2] else "KG"
+            shop_id = row[3] if len(row) > 3 and row[3] else None
+
+            try:
+                pname, vspec, ucode = _parse_material_name(raw_name, unit_code)
+            except ValueError as exc:
+                rows.append(
+                    {
+                        "row": idx,
+                        "raw_name": raw_name,
+                        "error": str(exc),
+                        "product_name": raw_name,
+                        "variant_spec": raw_name,
+                        "quantity": qty,
+                        "unit_code": "KG",
+                        "shop_id": shop_id,
+                    }
+                )
+                continue
+
+            rows.append(
+                {
+                    "row": idx,
+                    "raw_name": raw_name,
+                    "product_name": pname,
+                    "variant_spec": vspec,
+                    "quantity": qty,
+                    "unit_code": ucode,
+                    "shop_id": shop_id,
+                }
+            )
+
+        return Response({"count": len(rows), "rows": rows}, status=status.HTTP_200_OK)
+
+
+class BulkUploadConfirmView(APIView):
+    """POST confirmed rows -> create products/variants/stock levels + ledger."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        rows = request.data.get("rows", [])
+        shop_id = request.data.get("shop_id")
+        user = request.user
+
+        if not rows:
+            return Response({"error": "No rows to confirm."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Resolve shop
+        shop = None
+        if shop_id:
+            try:
+                shop = Shop.objects.get(pk=shop_id, is_deleted=False)
+            except Shop.DoesNotExist:
+                shop = None
+        if not shop:
+            shop = (
+                Shop.objects.filter(
+                    shop_type=Shop.ShopType.WAREHOUSE, is_deleted=False, is_active=True
+                ).first()
+                or Shop.objects.filter(is_deleted=False, is_active=True).first()
+            )
+        if not shop:
+            return Response(
+                {"error": "No valid shop found."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        created = 0
+        errors = []
+        results = []
+
+        with transaction.atomic():
+            for entry in rows:
+                try:
+                    pname = str(entry.get("product_name", "")).strip()
+                    vspec = str(entry.get("variant_spec", "")).strip()
+                    qty = float(entry.get("quantity", 0) or 0)
+                    ucode = str(entry.get("unit_code", "KG")).strip().upper()
+                    shop_pk = entry.get("shop_id", shop_id)
+
+                    if not pname or not vspec:
+                        raise ValueError("product_name and variant_spec required")
+
+                    # Shop for this row (override default)
+                    row_shop = shop
+                    if shop_pk:
+                        try:
+                            row_shop = Shop.objects.get(pk=shop_pk, is_deleted=False)
+                        except Shop.DoesNotExist:
+                            pass
+
+                    unit = _get_or_create_unit(ucode, ucode, "COUNT")
+                    product = _get_or_create_product(pname, ucode, user)
+                    spec_key = f"{pname}|{vspec}|{ucode}"
+                    variant = _get_or_create_variant(product, spec_key, unit, user)
+
+                    # Stock level
+                    level, _ = StockLevel.objects.get_or_create(
+                        shop=row_shop,
+                        variant=variant,
+                        defaults={"quantity": Decimal("0")},
+                    )
+                    level.quantity = (level.quantity or Decimal("0")) + Decimal(str(qty))
+                    level.save(update_fields=["quantity", "updated_at"])
+
+                    # Ledger row
+                    txn_id = f"BULK-{product.code}-{variant.id}"
+                    apply_movement(
+                        transaction_id=txn_id,
+                        kind=StockMovement.Kind.STOCK_IN,
+                        shop=row_shop,
+                        variant=variant,
+                        quantity=Decimal(str(qty)),
+                        direction=1,
+                        user=user,
+                    )
+
+                    created += 1
+                    results.append(
+                        {
+                            "raw_name": entry.get("raw_name", ""),
+                            "product": product.code,
+                            "product_name": product.name,
+                            "variant": variant.spec_key,
+                            "quantity": str(level.quantity),
+                            "unit": unit.code,
+                            "shop": row_shop.code,
+                        }
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(
+                        {"raw_name": entry.get("raw_name", ""), "error": str(exc)}
+                    )
+
+        return Response(
+            {
+                "created": created,
+                "errors": len(errors),
+                "results": results,
+                "error_details": errors,
+            },
+            status=status.HTTP_201_CREATED if created else status.HTTP_400_BAD_REQUEST,
+        )
