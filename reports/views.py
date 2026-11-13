@@ -7,7 +7,7 @@ from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.db.models import Q, Sum
 from django.http import HttpResponse
-from openpyxl import Workbook
+from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
@@ -27,6 +27,7 @@ from inventory.models import (
     StockTransfer,
     StockTransferItem,
 )
+from inventory.services import apply_movement
 from sales.models import Sale, SaleItem
 
 from .models import LowStockThreshold
