@@ -1032,16 +1032,7 @@ class BulkUploadConfirmView(APIView):
                     spec_key = f"{pname}|{vspec}|{ucode}"
                     variant = _get_or_create_variant(product, spec_key, unit, user)
 
-                    # Stock level
-                    level, _ = StockLevel.objects.get_or_create(
-                        shop=row_shop,
-                        variant=variant,
-                        defaults={"quantity": Decimal("0")},
-                    )
-                    level.quantity = (level.quantity or Decimal("0")) + Decimal(str(qty))
-                    level.save(update_fields=["quantity", "updated_at"])
-
-                    # Ledger row
+                    # Ledger row (apply_movement also updates StockLevel)
                     txn_id = f"BULK-{product.code}-{variant.id}"
                     apply_movement(
                         transaction_id=txn_id,
@@ -1051,6 +1042,11 @@ class BulkUploadConfirmView(APIView):
                         quantity=Decimal(str(qty)),
                         direction=1,
                         user=user,
+                    )
+
+                    # Read back the current level for the result
+                    level = StockLevel.objects.get(
+                        shop=row_shop, variant=variant
                     )
 
                     created += 1
