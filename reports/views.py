@@ -1004,7 +1004,7 @@ class BulkUploadConfirmView(APIView):
                     vspec = str(entry.get("variant_spec", "")).strip()
                     qty = float(entry.get("quantity", 0) or 0)
                     ucode = str(entry.get("unit_code", "KG")).strip().upper()
-                    shop_pk = entry.get("shop_id", shop_id)
+                    shop_code = str(entry.get("shop_id", shop_id or "")).strip()
 
                     if not pname or not vspec:
                         raise ValueError("product_name and variant_spec required")
@@ -1019,11 +1019,13 @@ class BulkUploadConfirmView(APIView):
                         )
                         continue
 
-                    # Shop for this row (override default)
+                    # Shop for this row (override default) - looked up by code (e.g. WH-001)
                     row_shop = shop
-                    if shop_pk:
+                    if shop_code:
                         try:
-                            row_shop = Shop.objects.get(pk=shop_pk, is_deleted=False)
+                            row_shop = Shop.objects.get(
+                                code=shop_code, is_deleted=False
+                            )
                         except Shop.DoesNotExist:
                             pass
 
