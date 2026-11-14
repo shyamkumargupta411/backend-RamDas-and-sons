@@ -17,7 +17,13 @@ from .models import (
 
 
 def get_in_transit_shop() -> Shop:
-    return Shop.objects.get(code="in-transit", shop_type=Shop.ShopType.IN_TRANSIT)
+    try:
+        return Shop.objects.get(code="in-transit", shop_type=Shop.ShopType.IN_TRANSIT)
+    except Shop.DoesNotExist:
+        raise ValidationError(
+            "In-Transit shop not found. Please create a shop with code 'in-transit' "
+            "and shop_type 'IN_TRANSIT' in the admin or via the API."
+        )
 
 
 def next_receipt_code() -> str:
